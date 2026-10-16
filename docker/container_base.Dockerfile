@@ -1,4 +1,4 @@
-ARG BASE_IMAGE=nvidia/cuda:12.8.1-cudnn-devel-ubuntu22.04
+ARG BASE_IMAGE=nvidia/cuda:13.0.2-cudnn-devel-ubuntu22.04
 FROM ${BASE_IMAGE}
 
 # Prevent interactive prompts
@@ -76,27 +76,24 @@ RUN wget -qO /tmp/gtsam-4.2.zip https://github.com/borglab/gtsam/archive/refs/ta
 # --------------------------------------------------------------------------- #
 # Python packages (Open3D + misc, avoid PyYAML uninstall issue)
 # --------------------------------------------------------------------------- #
-# PyTorch 2.9.1 + CUDA 12.8 (cu128) wheels ship SASS/PTX for Blackwell (sm_120),
-# so torch/vision/audio all match and run on the RTX PRO 6000. torch.version.cuda
-# is 12.8, matching nvcc from the CUDA 12.8 base image (pytorch3d/faiss verify this).
-RUN python3 -m pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 --index-url https://download.pytorch.org/whl/cu128
-# Lock the torch trio to the EXACT cu128 local build. Later `pip install`s
-# (timm, kornia, kaolin, ...) resolve against default PyPI, whose `torch 2.9.1`
-# is also a cu128 build pulling nvidia-*-cu12 (12.8) runtime wheels. A bare
-# `torch==2.9.1` pin can still let pip reshuffle the install set, so keep the
-# +cu128 pin aligned with the base image.
-RUN printf 'torch==2.9.1+cu128\ntorchvision==0.24.1+cu128\ntorchaudio==2.9.1+cu128\n' > /opt/pip-constraints.txt
-ENV PIP_CONSTRAINT=/opt/pip-constraints.txt
-# Expose the cu128 wheel index to every later pip step so the +cu128 pin above is
-# actually satisfiable (PyPI has no +cu128 build). Without this, resolving any
-# torch-dependent package (timm/kornia/kaolin) fails with ResolutionImpossible.
-ENV PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu128
 RUN python3 -m pip install --upgrade pip setuptools \
-    && python3 -m pip install \
+    && python3 -m pip install torch==2.9.1 torchvision==0.24.1 torchaudio==2.9.1 \
+        --index-url https://download.pytorch.org/whl/cu130
+
+# Fail the build now if torch isn't the CUDA 13 build
+RUN python3 -c "import torch; print(torch.__version__, torch.version.cuda); assert torch.version.cuda and torch.version.cuda.startswith('13')"
+
+# Plain pins (aarch64 wheels have no +cuXXX tag). Installed torch satisfies these,
+# so pip won't swap it for a PyPI build.
+RUN printf 'torch==2.9.1\ntorchvision==0.24.1\ntorchaudio==2.9.1\n' > /opt/pip-constraints.txt
+ENV PIP_CONSTRAINT=/opt/pip-constraints.txt
+ENV PIP_EXTRA_INDEX_URL=https://download.pytorch.org/whl/cu130
+
+RUN python3 -m pip install --no-cache-dir --ignore-installed PyYAML \
         pybind11 \
         scipy \
-        numpy \
-        --no-cache-dir --ignore-installed PyYAML "open3d==0.19.0" \
+        "numpy<2" \
+        "open3d==0.20.0" \
         matplotlib \
         h5py \
         opencv-python \
@@ -106,14 +103,23 @@ RUN python3 -m pip install --upgrade pip setuptools \
         timm==1.0.15 \
         attrdict \
         kornia \
-        small_gicp \
-        point-cloud-utils
+        small_gicp
 
 RUN cd /tmp \
-    && wget https://github.com/Kitware/CMake/releases/download/v3.31.3/cmake-3.31.3-linux-x86_64.sh \
-    && chmod +x cmake-3.31.3-linux-x86_64.sh \
-    && ./cmake-3.31.3-linux-x86_64.sh --skip-license --prefix=/usr/local \
-    && rm cmake-3.31.3-linux-x86_64.sh
+    && wget -q https://github.com/Kitware/CMake/releases/download/v3.31.3/cmake-3.31.3-linux-aarch64.tar.gz \
+    && mkdir -p /opt/cmake \
+    && tar -xzf cmake-3.31.3-linux-aarch64.tar.gz -C /opt/cmake --strip-components=1 \
+    && rm cmake-3.31.3-linux-aarch64.tar.gz
+ENV PATH=/opt/cmake/bin:${PATH}
+
+# Fail early if the wrong cmake is being picked up
+RUN which -a cmake && cmake --version
+
+RUN cd /tmp \
+    && git clone --recursive https://github.com/fwilliams/point-cloud-utils.git \
+    && cd point-cloud-utils \
+    && CMAKE_BUILD_PARALLEL_LEVEL=4 python3 -m pip install --no-cache-dir . \
+    && cd / && rm -rf /tmp/point-cloud-utils
 
 RUN apt-get update && apt-get install -y --no-install-recommends \
     libopenblas-dev \
@@ -124,19 +130,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # RTX PRO 6000). nvcc from the CUDA 13 base image is required for sm_120.
 RUN cd /tmp \
     && wget https://github.com/facebookresearch/faiss/archive/refs/tags/v1.13.0.tar.gz \
-    && tar -xvf v1.13.0.tar.gz \
-    && cd faiss-1.13.0 \
-    && mkdir build && cd build \
-    && cmake .. -DFAISS_ENABLE_GPU=ON \
-        -DFAISS_ENABLE_PYTHON=ON \
-        -DBUILD_TESTING=OFF \
-        -DCMAKE_BUILD_TYPE=Release \
-        -DFAISS_OPT_LEVEL=avx2 \
-        -DCMAKE_CUDA_ARCHITECTURES="80;86;90;120" \
-    && make -j$(nproc) \
-    && cd faiss/python \
-    && python3 -m pip install . \
-    && rm -rf /tmp/faiss
+    && tar -xf v1.13.0.tar.gz \
+    && cd faiss-1.13.0 && mkdir build && cd build \
+    && cmake .. -DFAISS_ENABLE_GPU=ON -DFAISS_ENABLE_PYTHON=ON -DBUILD_TESTING=OFF \
+        -DCMAKE_BUILD_TYPE=Release -DFAISS_OPT_LEVEL=generic \
+        -DCMAKE_CUDA_ARCHITECTURES="110" \
+    && make -j$(nproc) faiss swigfaiss \
+    && cd faiss/python && python3 -m pip install . \
+    && rm -rf /tmp/faiss-1.13.0 /tmp/v1.13.0.tar.gz
 
 # Install Node.js and npm for three.js web visualization
 RUN curl -fsSL https://deb.nodesource.com/setup_18.x | bash - \
@@ -146,7 +147,7 @@ RUN curl -fsSL https://deb.nodesource.com/setup_18.x | bash - \
 # Target GPU archs for source-built CUDA extensions (pytorch3d, kaolin):
 # Ampere (8.0/8.6), Hopper (9.0) and Blackwell (12.0). +PTX gives forward compat.
 # FORCE_CUDA ensures kernels build even though no GPU is visible during `docker build`.
-ENV TORCH_CUDA_ARCH_LIST="8.0;8.6;9.0;12.0+PTX"
+ENV TORCH_CUDA_ARCH_LIST="11.0+PTX"
 ENV FORCE_CUDA=1
 
 # pytorch3d from source so it compiles against torch 2.9.1 / cu128 for sm_120
@@ -175,6 +176,9 @@ RUN git clone --recursive https://github.com/NVIDIAGameWorks/kaolin.git /tmp/kao
     && git checkout v0.18.0 \
     && git submodule update --init --recursive \
     && python3 -m pip install cython \
-    && IGNORE_TORCH_VER=1 python3 -m pip install --no-cache-dir --no-build-isolation . \
+    && grep -viE '^\s*(usd-core|#|$)' tools/requirements.txt > /tmp/kaolin-reqs.txt \
+    && cat /tmp/kaolin-reqs.txt \
+    && python3 -m pip install --no-cache-dir -r /tmp/kaolin-reqs.txt \
+    && IGNORE_TORCH_VER=1 MAX_JOBS=4 python3 -m pip install -v --no-cache-dir --no-build-isolation --no-deps . \
     && cd / \
-    && rm -rf /tmp/kaolin
+    && rm -rf /tmp/kaolin /tmp/kaolin-reqs.txt

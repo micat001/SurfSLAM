@@ -49,7 +49,7 @@ Data from this project is available at [DeepBlue](https://deepblue.lib.umich.edu
 
 ## Setup
 
-We highly recommend using docker for this project and don't provide explicit support for non-docker setups. 
+We highly recommend using docker for this project and don't provide explicit support for non-docker setups.
 
 Check out the model submodules and apply our patches to them:
 ```bash
@@ -65,7 +65,7 @@ cd docker/
 ./build_user.sh
 ```
 
-**BEFORE** launch the docker container, you must tell the system where you downloaded data to:
+**BEFORE** launching the docker container, you must tell the system where you downloaded data to:
 
 ```bash
 cp cfg/dataset_paths.example.yaml cfg/dataset_paths.yaml
